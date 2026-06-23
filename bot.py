@@ -12,7 +12,15 @@ from aiogram.filters import Command
 # ── КОНФИГ ──
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SHEET_ID = os.getenv("SHEET_ID")
-ALLOWED_USER = int(os.getenv("ALLOWED_USER", "0"))  # твой Telegram ID
+# Список разрешённых Telegram ID (через запятую в ALLOWED_USERS,
+# либо отдельными переменными ALLOWED_USER и ALLOWED_USER_2)
+ALLOWED_USERS = set()
+for _key in ("ALLOWED_USERS", "ALLOWED_USER", "ALLOWED_USER_2"):
+    _val = os.getenv(_key, "")
+    for _part in _val.split(","):
+        _part = _part.strip()
+        if _part.isdigit():
+            ALLOWED_USERS.add(int(_part))
 CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")  # cloudinary://api_key:api_secret@cloud_name
 
 # ── GOOGLE SHEETS ──
@@ -59,7 +67,19 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 def is_allowed(message: Message) -> bool:
-    return message.from_user.id == ALLOWED_USER
+    return message.from_user.id in ALLOWED_USERS
+
+HELP_TEXT = (
+    "👟 Бот управления каталогом by Zozulia\n\n"
+    "Команды:\n"
+    "• <b>добавить Моника 1850 36 37 38</b> + фото\n"
+    "• <b>размер Моника убрать 38</b>\n"
+    "• <b>размер Моника добавить 38</b>\n"
+    "• <b>цена Моника 2000</b>\n"
+    "• <b>себестоимость Моника 900</b>\n"
+    "• <b>удалить Моника</b>\n"
+    "• <b>остатки</b> — показать все размеры в наличии"
+)
 
 # Ожидание фото после команды добавить
 pending_add = {}
@@ -68,18 +88,36 @@ pending_add = {}
 async def cmd_start(message: Message):
     if not is_allowed(message):
         return
-    await message.answer(
-        "👟 Бот управления каталогом by Zozulia\n\n"
-        "Команды:\n"
-        "• <b>добавить Моника 1850 36 37 38</b> + фото\n"
-        "• <b>размер Моника убрать 38</b>\n"
-        "• <b>размер Моника добавить 38</b>\n"
-        "• <b>цена Моника 2000</b>\n"
-        "• <b>себестоимость Моника 900</b>\n"
-        "• <b>удалить Моника</b>\n"
-        "• <b>остатки</b> — показать все размеры в наличии",
-        parse_mode="HTML"
-    )
+    await message.answer(HELP_TEXT, parse_mode="HTML")
+
+# ── ОСТАТКИ ──
+@dp.message(F.text.regexp(r"(?i)^\s*остатки\s*$"))
+async def cmd_stock(message: Message):
+    if not is_allowed(message): return
+
+    ws = get_catalog()
+    data = ws.get_all_records()
+
+    models = {}
+    for row in data:
+        if str(row.get("active", "")).upper() == "TRUE":
+            model = row["model"]
+            size = str(row["article"]).split("-")[-1]
+            if model not in models:
+                models[model] = {"sizes": [], "price": row["price"]}
+            models[model]["sizes"].append(size)
+
+    if not models:
+        await message.answer("📦 Каталог пуст")
+        return
+
+    text = "📦 <b>Остатки в наличии:</b>\n\n"
+    for model, info in models.items():
+        sizes_str = " ".join(info["sizes"])
+        text += f"<b>{model}</b> — {info['price']} грн\n"
+        text += f"Размеры: {sizes_str}\n\n"
+
+    await message.answer(text, parse_mode="HTML")
 
 # ── ДОБАВИТЬ модель ──
 @dp.message(F.text.regexp(r"(?i)^добавить\s+(\S+)\s+(\d+)\s+([\d\s]+)$"))
@@ -113,16 +151,13 @@ async def handle_photo(message: Message):
 
     await message.answer("⏳ Загружаю фото...")
 
-    # Скачиваем фото
     photo = message.photo[-1]
     file_info = await bot.get_file(photo.file_id)
     file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
     file_bytes = requests.get(file_url).content
 
-    # Загружаем в Cloudinary
     photo_url = upload_to_cloudinary(file_bytes, model.lower())
 
-    # Записываем в таблицу
     ws = get_catalog()
     rows = []
     for size in sizes:
@@ -151,8 +186,8 @@ async def cmd_size_remove(message: Message):
     data = ws.get_all_records()
 
     for i, row in enumerate(data, start=2):
-        if row["article"] == article:
-            ws.update_cell(i, 5, "FALSE")  # колонка E = active
+        if str(row["article"]) == article:
+            ws.update_cell(i, 5, "FALSE")
             await message.answer(f"✅ Размер <b>{article}</b> убран с сайта", parse_mode="HTML")
             return
 
@@ -171,13 +206,11 @@ async def cmd_size_add(message: Message):
     data = ws.get_all_records()
 
     for i, row in enumerate(data, start=2):
-        if row["article"] == article:
+        if str(row["article"]) == article:
             ws.update_cell(i, 5, "TRUE")
             await message.answer(f"✅ Размер <b>{article}</b> снова в наличии", parse_mode="HTML")
             return
 
-    # Если строки нет — создаём новую
-    # Ищем цену и фото существующей модели
     price = ""
     photo = ""
     for row in data:
@@ -203,7 +236,7 @@ async def cmd_price(message: Message):
 
     for i, row in enumerate(data, start=2):
         if row["model"] == model:
-            ws.update_cell(i, 3, new_price)  # колонка C = price
+            ws.update_cell(i, 3, new_price)
             updated += 1
 
     if updated:
@@ -228,7 +261,7 @@ async def cmd_cost(message: Message):
 
     for i, row in enumerate(data, start=2):
         if row["model"] == model:
-            ws.update_cell(i, 6, cost)  # колонка F = cost
+            ws.update_cell(i, 6, cost)
             updated += 1
 
     if updated:
@@ -254,7 +287,6 @@ async def cmd_delete(message: Message):
         if row["model"] == model:
             rows_to_delete.append(i)
 
-    # Удаляем снизу вверх чтобы индексы не сдвигались
     for row_idx in reversed(rows_to_delete):
         ws.delete_rows(row_idx)
 
@@ -266,35 +298,14 @@ async def cmd_delete(message: Message):
     else:
         await message.answer(f"❌ Модель <b>{model}</b> не найдена", parse_mode="HTML")
 
-# ── ОСТАТКИ ──
-@dp.message(F.text.lower() == "остатки")
-async def cmd_stock(message: Message):
+# ── НЕИЗВЕСТНАЯ КОМАНДА (должен быть последним) ──
+@dp.message(F.text)
+async def cmd_unknown(message: Message):
     if not is_allowed(message): return
-
-    ws = get_catalog()
-    data = ws.get_all_records()
-
-    # Группируем по моделям
-    models = {}
-    for row in data:
-        if str(row["active"]).upper() == "TRUE":
-            model = row["model"]
-            size = row["article"].split("-")[-1]
-            if model not in models:
-                models[model] = {"sizes": [], "price": row["price"]}
-            models[model]["sizes"].append(size)
-
-    if not models:
-        await message.answer("📦 Каталог пуст")
-        return
-
-    text = "📦 <b>Остатки в наличии:</b>\n\n"
-    for model, info in models.items():
-        sizes_str = " ".join(info["sizes"])
-        text += f"<b>{model}</b> — {info['price']} грн\n"
-        text += f"Размеры: {sizes_str}\n\n"
-
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(
+        "🤔 Не понял команду.\n\n" + HELP_TEXT,
+        parse_mode="HTML"
+    )
 
 # ── ЗАПУСК ──
 async def main():

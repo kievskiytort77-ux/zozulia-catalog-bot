@@ -4,6 +4,7 @@ import asyncio
 import gspread
 import requests
 from datetime import datetime
+from collections import Counter
 from google.oauth2.service_account import Credentials
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message
@@ -50,6 +51,10 @@ def get_catalog():
     sh = get_sheet()
     return sh.worksheet("catalog")
 
+def get_orders():
+    sh = get_sheet()
+    return sh.worksheet("orders")
+
 # ── CLOUDINARY UPLOAD ──
 def upload_to_cloudinary(file_bytes: bytes, public_id: str) -> str:
     import cloudinary
@@ -73,7 +78,9 @@ HELP_TEXT = (
     "👟 Бот управления каталогом by Zozulia\n\n"
     "Команды:\n"
     "• <b>добавить Моника 1850 36 37 38</b> + фото\n"
-    "• <b>размер Моника убрать 38</b>\n"
+    "• <b>продано Моника 37</b> — продажа (спишет пару + учёт)\n"
+    "• <b>вернули Моника 37</b> — возврат (вернёт пару + сторно)\n"
+    "• <b>размер Моника убрать 38</b> — скрыть без продажи\n"
     "• <b>размер Моника добавить 38</b>\n"
     "• <b>цена Моника 2000</b>\n"
     "• <b>себестоимость Моника 900</b>\n"
@@ -113,8 +120,6 @@ async def cmd_stock(message: Message):
 
     text = "📦 <b>Остатки в наличии:</b>\n\n"
     for model, info in models.items():
-        # Считаем количество пар каждого размера (несколько строк = несколько пар)
-        from collections import Counter
         counts = Counter(info["sizes"])
         sizes_str = " ".join(
             f"{s}×{c}" if c > 1 else s
@@ -179,7 +184,134 @@ async def handle_photo(message: Message):
         parse_mode="HTML"
     )
 
-# ── УБРАТЬ размер (списать ОДНУ пару со склада) ──
+# ── Вспомогательное: цена и себестоимость модели ──
+def get_price_cost(catalog_data, model):
+    price = ""
+    cost = ""
+    for row in catalog_data:
+        if row["model"] == model:
+            price = row.get("price", "")
+            cost = row.get("cost", "")
+            break
+    return price, cost
+
+# ── Вспомогательное: следующий order_id ──
+def next_order_id(orders_data):
+    max_id = 0
+    for row in orders_data:
+        try:
+            val = int(str(row.get("order_id", "")).strip())
+            if val > max_id:
+                max_id = val
+        except (ValueError, TypeError):
+            continue
+    return max_id + 1
+
+# ── ПРОДАНО (списать пару + записать продажу в orders) ──
+@dp.message(F.text.regexp(r"(?i)^продано\s+(\S+)\s+(\d+)$"))
+async def cmd_sold(message: Message):
+    if not is_allowed(message): return
+    match = re.match(r"(?i)^продано\s+(\S+)\s+(\d+)$", message.text)
+    model = match.group(1).capitalize()
+    size = match.group(2)
+    article = f"{model}-{size}"
+
+    cat = get_catalog()
+    cat_data = cat.get_all_records()
+
+    # 1. Списываем ОДНУ доступную пару (первую строку с active=TRUE)
+    sold = False
+    for i, row in enumerate(cat_data, start=2):
+        if str(row["article"]) == article and str(row.get("active", "")).upper() == "TRUE":
+            cat.update_cell(i, 5, "FALSE")
+            sold = True
+            break
+
+    if not sold:
+        await message.answer(
+            f"❌ Размер <b>{article}</b> отсутствует в наличии — продать нечего",
+            parse_mode="HTML"
+        )
+        return
+
+    # 2. Цена и себестоимость из каталога
+    price, cost = get_price_cost(cat_data, model)
+
+    # 3. Запись продажи в orders
+    orders = get_orders()
+    orders_data = orders.get_all_records()
+    oid = next_order_id(orders_data)
+    today = datetime.now().strftime("%Y-%m-%d")
+    # order_id, date, article, model, size, client_name, client_card, amount, status, cost
+    orders.append_rows([[oid, today, article, model, size, "", "", price, "Продано", cost]])
+
+    # 4. Остаток
+    remaining = sum(
+        1 for r in cat_data
+        if str(r["article"]) == article
+        and str(r.get("active", "")).upper() == "TRUE"
+    ) - 1
+
+    tail = (
+        f"Осталось в наличии: <b>{remaining}</b> пар"
+        if remaining > 0 else
+        "Это была последняя пара — размер убран с сайта"
+    )
+    await message.answer(
+        f"💰 Продажа записана: <b>{article}</b>\n"
+        f"Цена: {price} грн · order #{oid}\n"
+        f"{tail}",
+        parse_mode="HTML"
+    )
+
+# ── ВЕРНУЛИ (вернуть пару + сторно в orders) ──
+@dp.message(F.text.regexp(r"(?i)^вернули\s+(\S+)\s+(\d+)$"))
+async def cmd_return(message: Message):
+    if not is_allowed(message): return
+    match = re.match(r"(?i)^вернули\s+(\S+)\s+(\d+)$", message.text)
+    model = match.group(1).capitalize()
+    size = match.group(2)
+    article = f"{model}-{size}"
+
+    cat = get_catalog()
+    cat_data = cat.get_all_records()
+
+    # 1. Возвращаем пару: оживляем строку, которая FALSE
+    returned = False
+    for i, row in enumerate(cat_data, start=2):
+        if str(row["article"]) == article and str(row.get("active", "")).upper() != "TRUE":
+            cat.update_cell(i, 5, "TRUE")
+            returned = True
+            break
+
+    # Если FALSE-строки нет — создаём новую (товар вернулся физически)
+    if not returned:
+        price_new, _ = get_price_cost(cat_data, model)
+        photo = ""
+        for row in cat_data:
+            if row["model"] == model:
+                photo = row.get("photo", "")
+                break
+        cat.append_rows([[model, article, price_new, photo, "TRUE", ""]])
+
+    # 2. Сторно-строка в orders (минус — гасит продажу в аналитике)
+    price, cost = get_price_cost(cat_data, model)
+    neg_amount = f"-{price}" if str(price).strip() else ""
+    neg_cost = f"-{cost}" if str(cost).strip() else ""
+
+    orders = get_orders()
+    orders_data = orders.get_all_records()
+    oid = next_order_id(orders_data)
+    today = datetime.now().strftime("%Y-%m-%d")
+    orders.append_rows([[oid, today, article, model, size, "", "", neg_amount, "Возврат", neg_cost]])
+
+    await message.answer(
+        f"↩️ Возврат оформлен: <b>{article}</b>\n"
+        f"Пара снова в наличии · сторно записано (order #{oid})",
+        parse_mode="HTML"
+    )
+
+# ── УБРАТЬ размер (скрыть без продажи — служебное) ──
 @dp.message(F.text.regexp(r"(?i)^размер\s+(\S+)\s+убрать\s+(\d+)$"))
 async def cmd_size_remove(message: Message):
     if not is_allowed(message): return
@@ -191,40 +323,33 @@ async def cmd_size_remove(message: Message):
     ws = get_catalog()
     data = ws.get_all_records()
 
-    # Ищем ПЕРВУЮ строку этого размера, которая ещё в наличии (active = TRUE)
     for i, row in enumerate(data, start=2):
         if str(row["article"]) == article and str(row.get("active", "")).upper() == "TRUE":
             ws.update_cell(i, 5, "FALSE")
-
-            # Считаем, сколько пар этого размера ещё осталось в наличии
             remaining = sum(
                 1 for r in data
                 if str(r["article"]) == article
                 and str(r.get("active", "")).upper() == "TRUE"
-            ) - 1  # минус та пара, что только что списали
-
+            ) - 1
             if remaining > 0:
                 await message.answer(
-                    f"✅ Списана 1 пара <b>{article}</b>.\n"
-                    f"Осталось в наличии: <b>{remaining}</b> пар",
+                    f"✅ Скрыта 1 пара <b>{article}</b> (без учёта продажи).\n"
+                    f"Осталось: <b>{remaining}</b>",
                     parse_mode="HTML"
                 )
             else:
                 await message.answer(
-                    f"✅ Списана последняя пара <b>{article}</b>.\n"
-                    f"Размер убран с сайта (закончился)",
+                    f"✅ <b>{article}</b> скрыт с сайта (без учёта продажи)",
                     parse_mode="HTML"
                 )
             return
 
-    # Ни одной доступной пары не нашли
     await message.answer(
-        f"❌ Размер <b>{article}</b> уже отсутствует в наличии "
-        f"(или артикул не найден)",
+        f"❌ Размер <b>{article}</b> уже отсутствует в наличии",
         parse_mode="HTML"
     )
 
-# ── ДОБАВИТЬ размер обратно (добавить ОДНУ пару) ──
+# ── ДОБАВИТЬ размер обратно (служебное, +1 пара) ──
 @dp.message(F.text.regexp(r"(?i)^размер\s+(\S+)\s+добавить\s+(\d+)$"))
 async def cmd_size_add(message: Message):
     if not is_allowed(message): return
@@ -236,14 +361,12 @@ async def cmd_size_add(message: Message):
     ws = get_catalog()
     data = ws.get_all_records()
 
-    # Сначала пробуем "оживить" уже существующую строку этого размера, которая FALSE
     for i, row in enumerate(data, start=2):
         if str(row["article"]) == article and str(row.get("active", "")).upper() != "TRUE":
             ws.update_cell(i, 5, "TRUE")
             await message.answer(f"✅ Размер <b>{article}</b> снова в наличии (+1 пара)", parse_mode="HTML")
             return
 
-    # Если такой строки нет — добавляем новую пару (берём цену и фото у модели)
     price = ""
     photo = ""
     for row in data:

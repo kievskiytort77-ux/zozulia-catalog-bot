@@ -113,7 +113,13 @@ async def cmd_stock(message: Message):
 
     text = "📦 <b>Остатки в наличии:</b>\n\n"
     for model, info in models.items():
-        sizes_str = " ".join(info["sizes"])
+        # Считаем количество пар каждого размера (несколько строк = несколько пар)
+        from collections import Counter
+        counts = Counter(info["sizes"])
+        sizes_str = " ".join(
+            f"{s}×{c}" if c > 1 else s
+            for s, c in sorted(counts.items())
+        )
         text += f"<b>{model}</b> — {info['price']} грн\n"
         text += f"Размеры: {sizes_str}\n\n"
 
@@ -173,7 +179,7 @@ async def handle_photo(message: Message):
         parse_mode="HTML"
     )
 
-# ── УБРАТЬ размер ──
+# ── УБРАТЬ размер (списать ОДНУ пару со склада) ──
 @dp.message(F.text.regexp(r"(?i)^размер\s+(\S+)\s+убрать\s+(\d+)$"))
 async def cmd_size_remove(message: Message):
     if not is_allowed(message): return
@@ -185,15 +191,40 @@ async def cmd_size_remove(message: Message):
     ws = get_catalog()
     data = ws.get_all_records()
 
+    # Ищем ПЕРВУЮ строку этого размера, которая ещё в наличии (active = TRUE)
     for i, row in enumerate(data, start=2):
-        if str(row["article"]) == article:
+        if str(row["article"]) == article and str(row.get("active", "")).upper() == "TRUE":
             ws.update_cell(i, 5, "FALSE")
-            await message.answer(f"✅ Размер <b>{article}</b> убран с сайта", parse_mode="HTML")
+
+            # Считаем, сколько пар этого размера ещё осталось в наличии
+            remaining = sum(
+                1 for r in data
+                if str(r["article"]) == article
+                and str(r.get("active", "")).upper() == "TRUE"
+            ) - 1  # минус та пара, что только что списали
+
+            if remaining > 0:
+                await message.answer(
+                    f"✅ Списана 1 пара <b>{article}</b>.\n"
+                    f"Осталось в наличии: <b>{remaining}</b> пар",
+                    parse_mode="HTML"
+                )
+            else:
+                await message.answer(
+                    f"✅ Списана последняя пара <b>{article}</b>.\n"
+                    f"Размер убран с сайта (закончился)",
+                    parse_mode="HTML"
+                )
             return
 
-    await message.answer(f"❌ Артикул <b>{article}</b> не найден", parse_mode="HTML")
+    # Ни одной доступной пары не нашли
+    await message.answer(
+        f"❌ Размер <b>{article}</b> уже отсутствует в наличии "
+        f"(или артикул не найден)",
+        parse_mode="HTML"
+    )
 
-# ── ДОБАВИТЬ размер обратно ──
+# ── ДОБАВИТЬ размер обратно (добавить ОДНУ пару) ──
 @dp.message(F.text.regexp(r"(?i)^размер\s+(\S+)\s+добавить\s+(\d+)$"))
 async def cmd_size_add(message: Message):
     if not is_allowed(message): return
@@ -205,12 +236,14 @@ async def cmd_size_add(message: Message):
     ws = get_catalog()
     data = ws.get_all_records()
 
+    # Сначала пробуем "оживить" уже существующую строку этого размера, которая FALSE
     for i, row in enumerate(data, start=2):
-        if str(row["article"]) == article:
+        if str(row["article"]) == article and str(row.get("active", "")).upper() != "TRUE":
             ws.update_cell(i, 5, "TRUE")
-            await message.answer(f"✅ Размер <b>{article}</b> снова в наличии", parse_mode="HTML")
+            await message.answer(f"✅ Размер <b>{article}</b> снова в наличии (+1 пара)", parse_mode="HTML")
             return
 
+    # Если такой строки нет — добавляем новую пару (берём цену и фото у модели)
     price = ""
     photo = ""
     for row in data:
@@ -220,7 +253,7 @@ async def cmd_size_add(message: Message):
             break
 
     ws.append_rows([[model, article, price, photo, "TRUE", ""]])
-    await message.answer(f"✅ Размер <b>{article}</b> добавлен в каталог", parse_mode="HTML")
+    await message.answer(f"✅ Размер <b>{article}</b> добавлен в каталог (+1 пара)", parse_mode="HTML")
 
 # ── ЦЕНА ──
 @dp.message(F.text.regexp(r"(?i)^цена\s+(\S+)\s+(\d+)$"))
